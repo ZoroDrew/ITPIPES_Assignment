@@ -1,0 +1,144 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="760" viewBox="0 0 1400 760" role="img" aria-labelledby="title desc">
+  <title id="title">Legacy file conversion service architecture</title>
+  <desc id="desc">Internal callers submit jobs through API Gateway and Lambda and may poll as a fallback. DynamoDB is the job state authority. Import and export queues feed isolated ECS worker fleets. Workers read inputs and write attempt-scoped results in S3. DynamoDB Streams push terminal-state webhooks to an optional caller callback. A reconciler repairs stuck jobs, a CI/CD pipeline deploys a canary, and CloudWatch receives native metrics and embedded metrics from logs.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke"/>
+    </marker>
+    <style>
+      .canvas { fill: #ffffff; }
+      .title { font: 600 28px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #172033; }
+      .label { font: 600 18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #172033; text-anchor: middle; }
+      .detail { font: 400 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #45536a; text-anchor: middle; }
+      .edge-label { font: 500 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #45536a; text-anchor: middle; }
+      .service { fill: #e8f1ff; stroke: #3975c6; }
+      .state { fill: #f0eaff; stroke: #7357b5; }
+      .queue { fill: #fff3df; stroke: #c47a13; }
+      .worker { fill: #e7f7ef; stroke: #33865d; }
+      .storage { fill: #edf0f4; stroke: #65738a; }
+      .notify { fill: #f8eaf4; stroke: #a14c83; }
+      .support { fill: #f5f6f8; stroke: #7b8492; }
+      .node { stroke-width: 2; rx: 12; }
+      .edge { fill: none; stroke: #59677d; stroke-width: 2.2; marker-end: url(#arrow); }
+      .bi-edge { fill: none; stroke: #59677d; stroke-width: 2.2; marker-start: url(#arrow); marker-end: url(#arrow); }
+      .recovery { fill: none; stroke: #7b8492; stroke-width: 2; stroke-dasharray: 8 6; marker-end: url(#arrow); }
+      @media (prefers-color-scheme: dark) {
+        .canvas { fill: #0d1117; }
+        .title, .label { fill: #e6edf3; }
+        .detail, .edge-label { fill: #a9b4c2; }
+        .service { fill: #102744; stroke: #6aa6f8; }
+        .state { fill: #271d3d; stroke: #a78bdb; }
+        .queue { fill: #35260f; stroke: #e6a84b; }
+        .worker { fill: #122e22; stroke: #65bd8e; }
+        .storage { fill: #202731; stroke: #8b98aa; }
+        .notify { fill: #361b2d; stroke: #d176ad; }
+        .support { fill: #20252d; stroke: #9099a6; }
+        .edge, .bi-edge { stroke: #a9b4c2; }
+        .recovery { stroke: #9099a6; }
+      }
+    </style>
+  </defs>
+
+  <rect class="canvas" width="1400" height="760"/>
+  <text class="title" x="40" y="48">Legacy File Conversion Service — High-Level Architecture</text>
+
+  <!-- Nodes -->
+  <rect class="node service" x="40" y="300" width="170" height="86"/>
+  <text class="label" x="125" y="335">Internal callers</text>
+  <text class="detail" x="125" y="360">submit + optional poll</text>
+
+  <rect class="node service" x="270" y="300" width="190" height="86"/>
+  <text class="label" x="365" y="335">API Gateway</text>
+  <text class="detail" x="365" y="360">submission Lambda</text>
+
+  <rect class="node state" x="555" y="78" width="250" height="108"/>
+  <text class="label" x="680" y="113">DynamoDB jobs</text>
+  <text class="detail" x="680" y="140">state · lease · attempt</text>
+  <text class="detail" x="680" y="162">output key · webhook status</text>
+
+  <rect class="node queue" x="545" y="260" width="220" height="76"/>
+  <text class="label" x="655" y="290">Import SQS</text>
+  <text class="detail" x="655" y="314">queue + DLQ</text>
+
+  <rect class="node queue" x="545" y="390" width="220" height="76"/>
+  <text class="label" x="655" y="420">Export SQS</text>
+  <text class="detail" x="655" y="444">queue + DLQ</text>
+
+  <rect class="node worker" x="850" y="260" width="230" height="76"/>
+  <text class="label" x="965" y="290">Import ECS fleet</text>
+  <text class="detail" x="965" y="314">TypeScript converter</text>
+
+  <rect class="node worker" x="850" y="390" width="230" height="76"/>
+  <text class="label" x="965" y="420">Export ECS fleet</text>
+  <text class="detail" x="965" y="444">vendor JVM writer</text>
+
+  <rect class="node storage" x="1160" y="300" width="200" height="126"/>
+  <text class="label" x="1260" y="337">Amazon S3</text>
+  <text class="detail" x="1260" y="364">input objects</text>
+  <text class="detail" x="1260" y="386">attempt-scoped results</text>
+  <text class="detail" x="1260" y="408">JSON / ZIP</text>
+
+  <rect class="node notify" x="900" y="78" width="190" height="108"/>
+  <text class="label" x="995" y="113">Completion queue</text>
+  <text class="detail" x="995" y="140">from DynamoDB Stream</text>
+  <text class="detail" x="995" y="162">after terminal state</text>
+
+  <rect class="node service" x="1170" y="78" width="190" height="108"/>
+  <text class="label" x="1265" y="113">Caller callback</text>
+  <text class="detail" x="1265" y="140">push succeeded / failed</text>
+  <text class="detail" x="1265" y="162">at-least-once delivery</text>
+
+  <rect class="node support" x="270" y="570" width="220" height="90"/>
+  <text class="label" x="380" y="607">Reconciler</text>
+  <text class="detail" x="380" y="633">repair · terminalize · redrive</text>
+
+  <rect class="node support" x="590" y="570" width="230" height="90"/>
+  <text class="label" x="705" y="607">CI/CD + canary</text>
+  <text class="detail" x="705" y="633">versioned staged rollout</text>
+
+  <rect class="node support" x="920" y="570" width="250" height="90"/>
+  <text class="label" x="1045" y="600">CloudWatch / alarms</text>
+  <text class="detail" x="1045" y="625">SQS + ECS native metrics</text>
+  <text class="detail" x="1045" y="647">worker + reconciler EMF logs</text>
+
+  <!-- Primary request and dispatch paths -->
+  <path class="edge" d="M 210 343 L 270 343"/>
+  <text class="edge-label" x="240" y="286">submit / optional poll</text>
+
+  <path class="edge" d="M 460 320 C 500 260, 505 190, 555 150"/>
+  <text class="edge-label" x="485" y="230">create / read job</text>
+
+  <path class="edge" d="M 460 342 C 500 342, 505 298, 545 298"/>
+  <text class="edge-label" x="505" y="315">import</text>
+
+  <path class="edge" d="M 460 360 C 500 360, 505 428, 545 428"/>
+  <text class="edge-label" x="505" y="405">export</text>
+
+  <path class="edge" d="M 765 298 L 850 298"/>
+  <path class="edge" d="M 765 428 L 850 428"/>
+
+  <!-- State and storage paths -->
+  <path class="bi-edge" d="M 925 260 C 900 205, 820 165, 805 150"/>
+  <path class="bi-edge" d="M 900 390 C 820 330, 790 230, 770 186"/>
+  <text class="edge-label" x="865" y="205">claim · lease · state · output key</text>
+
+  <path class="bi-edge" d="M 1080 298 C 1120 298, 1120 340, 1160 340"/>
+  <path class="bi-edge" d="M 1080 428 C 1120 428, 1120 388, 1160 388"/>
+  <text class="edge-label" x="1120" y="278">read input</text>
+  <text class="edge-label" x="1120" y="451">write result</text>
+
+  <!-- Notification path -->
+  <path class="edge" d="M 805 132 L 900 132"/>
+  <path class="edge" d="M 1090 132 L 1170 132"/>
+
+  <!-- Recovery paths -->
+  <path class="recovery" d="M 490 592 C 555 560, 600 500, 640 466"/>
+  <path class="recovery" d="M 490 615 C 570 610, 640 220, 660 186"/>
+  <text class="edge-label" x="585" y="570">stuck jobs / DLQ</text>
+
+  <!-- Deployment and observability -->
+  <path class="recovery" d="M 705 570 C 720 520, 835 500, 905 466"/>
+  <path class="recovery" d="M 735 570 C 780 520, 850 375, 920 336"/>
+  <text class="edge-label" x="790" y="535">deploy / compare version</text>
+  <text class="detail" x="700" y="720">Solid arrows: normal job path · Two-headed arrows: reads and conditional updates · Dashed arrows: recovery/deployment</text>
+</svg>

@@ -1,0 +1,7 @@
+node_modules/
+coverage/
+*.log
+*.docx
+*.pdf
+Platform Homework_ Legacy File Conversion Service (Candidate Version).md
+.DS_Store
