@@ -56,3 +56,33 @@ atomic, intention-revealing operations:
 The in-memory store documents the conditions a DynamoDB adapter would implement
 with conditional expressions. Production AWS adapters and infrastructure are
 outside this exercise's code scope.
+
+## Follow-up branch
+
+The original assignment README above is preserved. This branch implements the
+next steps that were previously outside the time-boxed repair:
+
+- `claim()` now performs `queued/expired-running -> running` and atomically
+  installs an attempt token, lease expiry, worker version, and incremented
+  application attempt.
+- A periodic heartbeat conditionally renews the DynamoDB lease and extends SQS
+  visibility. A worker that cannot prove ownership kills/reaps its converter
+  before deferring the delivery.
+- Success and failure publication require a `running` state, matching fencing
+  token, and unexpired lease.
+- `QueueMessage.retry()` is replaced by `defer(delayMs)`. The concrete SQS
+  adapter maps `ack()` to `DeleteMessage`, and defer/heartbeat operations to
+  `ChangeMessageVisibility`.
+- Busy duplicate deliveries defer until near the active lease expiry;
+  conversion retries use bounded exponential backoff.
+
+Additional files in this branch:
+
+- `src/dynamoDbJobStore.ts` — DynamoDB lease/fencing conditional expressions
+- `src/sqsQueueMessage.ts` — SQS delete and visibility-change adapter
+- `test/adapters.test.ts` — AWS adapter command/conditional contract tests
+
+The AWS adapters are dependency-injected and their tests use scripted SDK
+clients, so verification still requires no AWS credentials. Deployment
+infrastructure, S3 publication, the reconciler/DLQ consumer, and webhook
+delivery remain outside this worker-focused code.

@@ -121,3 +121,59 @@ Then I prompted AI to write tests that cover below scenarios:
 If I continued, I would implement the DynamoDB conditional expressions and
 lease heartbeat, then add adapter contract tests for acknowledgement
 failures and expired-owner recovery.
+
+## Follow-up branch notes
+
+The original time-box notes above are preserved as the submission's historical
+stopping point. This branch implements the next-step work described in the last
+paragraph.
+
+### Added implementation
+
+- `JobStore.claim()` now accepts `nowMs`, lease duration, attempt token, and
+  worker version. It atomically claims `queued` work or reclaims an expired
+  `running` lease and increments the application attempt count.
+- `renewLease()` succeeds only for the current token while its lease is live.
+  The worker runs a periodic heartbeat, then extends SQS visibility after the
+  DynamoDB renewal. If it can no longer prove ownership, it kills/reaps the
+  converter and defers the message.
+- Success and failure publication require `running` state, a matching fencing
+  token, and an unexpired lease.
+- `QueueMessage.retry()` is replaced by `defer(delayMs)`. Busy deliveries defer
+  near lease expiry; conversion retries use bounded exponential backoff. The
+  SQS adapter uses `DeleteMessage` for `ack()` and
+  `ChangeMessageVisibility` for defer and visibility heartbeat operations.
+- `DynamoDbJobStore` includes concrete conditional expressions for claim,
+  heartbeat, success, and failure. After a failed claim, a strongly consistent
+  read classifies the record as missing, terminal, or busy and returns the
+  remaining lease delay.
+
+### Added and corrected tests
+
+- The stale-publication test now completes the old attempt while the newer
+  token still owns a `running` job. This closes the discovered gap where all
+  previous tests remained green after removing the token comparison.
+- Tests cover expired-lease reclaim, rejection of the old owner's renew and
+  publish calls, heartbeat renewal, and kill/defer after ownership loss.
+- A worker-level acknowledgement-failure test proves that redelivery observes
+  the terminal state and does not run a second conversion.
+- Adapter tests cover failed `DeleteMessage`, visibility-delay rounding,
+  queued/expired claim conditions, busy classification, and the token/live-
+  lease conditions for heartbeat and publication.
+
+### Remaining follow-up risks
+
+- S3 upload/checksum/multipart cleanup, ECS task protection, the DLQ/reconciler,
+  submission outbox, and webhook delivery are still design-only.
+- `conversion.kill()` still needs a bounded graceful-terminate/SIGKILL deadline
+  for the case where cleanup itself never settles.
+- DynamoDB and SQS heartbeat operations are not atomic. DynamoDB remains the
+  ownership authority; a visibility failure currently stops work
+  conservatively and recovery waits for the renewed lease to expire.
+- Lease timestamps use the client clock. Production needs synchronized hosts,
+  lease duration well above expected skew/jitter, and a reclaim margin.
+- Adapter tests use scripted SDK clients. DynamoDB Local/LocalStack tests should
+  execute the expressions against an engine before deployment.
+- The successful-conversion path does not cancel its outstanding timeout timer.
+- Submission DynamoDB/SQS dual-write recovery, repeated queue API failures,
+  metrics/structured logs, and abandoned-attempt cleanup remain unimplemented.
