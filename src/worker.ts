@@ -8,15 +8,32 @@ export interface Job {
   status: JobStatus;
   attempt: number;
   activeAttemptToken?: string;
+  leaseExpiresAtMs?: number;
+  workerVersion?: string;
   timeoutCount?: number;
   resourceExhaustionCount?: number;
   outputKey?: string;
   error?: string;
 }
 
+export interface ClaimRequest {
+  id: string;
+  attemptToken: string;
+  nowMs: number;
+  leaseDurationMs: number;
+  workerVersion: string;
+}
+
+export interface RenewLeaseRequest {
+  id: string;
+  attemptToken: string;
+  nowMs: number;
+  leaseDurationMs: number;
+}
+
 export type ClaimResult =
   | { kind: "claimed"; job: Job }
-  | { kind: "busy" }
+  | { kind: "busy"; retryAfterMs: number }
   | { kind: "terminal" }
   | { kind: "missing" };
 
@@ -28,34 +45,41 @@ export interface FailureTransition {
 }
 
 export interface JobStore {
-  /** Atomically changes queued -> running, increments attempt, and installs token. */
-  claim(id: string, attemptToken: string): Promise<ClaimResult>;
+  /** Atomically claims queued work or an expired running lease. */
+  claim(request: ClaimRequest): Promise<ClaimResult>;
 
-  /** Applies only while this token still owns the running attempt. */
+  /** Extends only a live lease still owned by this token. */
+  renewLease(request: RenewLeaseRequest): Promise<boolean>;
+
+  /** Applies only while this token still owns a live running lease. */
   finishSuccess(
     id: string,
     attemptToken: string,
     outputKey: string,
+    nowMs: number,
   ): Promise<boolean>;
 
-  /** Applies only while this token still owns the running attempt. */
+  /** Applies only while this token still owns a live running lease. */
   finishFailure(
     id: string,
     attemptToken: string,
     transition: FailureTransition,
+    nowMs: number,
   ): Promise<boolean>;
 }
 
 export interface QueueMessage {
   jobId: string;
   receiveCount: number;
+  /** Deletes the current SQS delivery using its receipt handle. */
   ack(): Promise<void>;
+  /** Extends the current in-flight delivery while its owner is healthy. */
+  extendVisibility(durationMs: number): Promise<void>;
   /**
-   * Defers this delivery using queue visibility/backoff; it must not be an
-   * immediate nack. A production busy claim should defer until near the
-   * current owner's lease expiry.
+   * Keeps this delivery but makes it visible again after a bounded delay.
+   * A production SQS adapter implements this with ChangeMessageVisibility.
    */
-  retry(): Promise<void>;
+  defer(delayMs: number): Promise<void>;
 }
 
 export interface RunningConversion {
@@ -73,16 +97,43 @@ export interface Clock {
   timeout(ms: number): Promise<never>;
 }
 
+export interface RunningLeaseHeartbeat {
+  /** Rejects if renewal fails or this attempt no longer owns a live lease. */
+  lost: Promise<never>;
+  stop(): Promise<void>;
+}
+
+export type StartLeaseHeartbeat = (
+  renew: () => Promise<boolean>,
+  intervalMs: number,
+) => RunningLeaseHeartbeat;
+
 export interface HandlerOptions {
   timeoutMs: number;
   maxAttempts: number;
+  leaseDurationMs: number;
+  heartbeatIntervalMs: number;
+  messageVisibilityMs: number;
+  busyDeferBufferMs: number;
+  ownershipLostDeferMs: number;
+  workerVersion: string;
+  now: () => number;
+  retryDelayMs: (attempt: number) => number;
   tokenFactory: () => string;
+  startHeartbeat: StartLeaseHeartbeat;
 }
 
 export class ConversionTimedOutError extends Error {
   constructor(timeoutMs: number) {
     super(`conversion timed out after ${timeoutMs}ms`);
     this.name = "ConversionTimedOutError";
+  }
+}
+
+export class LeaseLostError extends Error {
+  constructor(message = "job lease could not be renewed") {
+    super(message);
+    this.name = "LeaseLostError";
   }
 }
 
@@ -97,10 +148,21 @@ export class ConversionError extends Error {
   }
 }
 
+const MAX_SQS_VISIBILITY_MS = 12 * 60 * 60_000;
+
 const DEFAULT_OPTIONS: HandlerOptions = {
   timeoutMs: 15 * 60_000,
   maxAttempts: 3,
+  leaseDurationMs: 3 * 60_000,
+  heartbeatIntervalMs: 60_000,
+  messageVisibilityMs: 5 * 60_000,
+  busyDeferBufferMs: 1_000,
+  ownershipLostDeferMs: 30_000,
+  workerVersion: process.env.WORKER_VERSION ?? "dev",
+  now: Date.now,
+  retryDelayMs: (attempt) => Math.min(5_000 * 2 ** (attempt - 1), 5 * 60_000),
   tokenFactory: randomUUID,
+  startHeartbeat: startIntervalLeaseHeartbeat,
 };
 
 export async function handle(
@@ -111,8 +173,16 @@ export async function handle(
   options: Partial<HandlerOptions> = {},
 ): Promise<void> {
   const settings = { ...DEFAULT_OPTIONS, ...options };
+  validateLeaseSettings(settings);
+
   const attemptToken = settings.tokenFactory();
-  const claim = await store.claim(message.jobId, attemptToken);
+  const claim = await store.claim({
+    id: message.jobId,
+    attemptToken,
+    nowMs: settings.now(),
+    leaseDurationMs: settings.leaseDurationMs,
+    workerVersion: settings.workerVersion,
+  });
 
   if (claim.kind === "missing" || claim.kind === "terminal") {
     await message.ack();
@@ -120,13 +190,56 @@ export async function handle(
   }
 
   if (claim.kind === "busy") {
-    // Do not delete a duplicate while another delivery owns the job. If that
-    // owner crashes, a later delivery must remain available to recover it.
-    await message.retry();
+    // Keep the duplicate as a recovery trigger, but avoid a hot receive loop.
+    await message.defer(
+      boundedDelay(claim.retryAfterMs + settings.busyDeferBufferMs),
+    );
     return;
   }
 
   const job = claim.job;
+  const heartbeat = settings.startHeartbeat(
+    async () => {
+      const renewed = await store.renewLease({
+        id: job.id,
+        attemptToken,
+        nowMs: settings.now(),
+        leaseDurationMs: settings.leaseDurationMs,
+      });
+      if (!renewed) return false;
+      // SQS visibility is a delivery aid; DynamoDB remains ownership authority.
+      await message.extendVisibility(settings.messageVisibilityMs);
+      return true;
+    },
+    settings.heartbeatIntervalMs,
+  );
+
+  try {
+    await runClaimedAttempt(
+      message,
+      store,
+      converter,
+      clock,
+      settings,
+      heartbeat,
+      job,
+      attemptToken,
+    );
+  } finally {
+    await heartbeat.stop();
+  }
+}
+
+async function runClaimedAttempt(
+  message: QueueMessage,
+  store: JobStore,
+  converter: Converter,
+  clock: Clock,
+  settings: HandlerOptions,
+  heartbeat: RunningLeaseHeartbeat,
+  job: Job,
+  attemptToken: string,
+): Promise<void> {
   const outputKey = `jobs/${job.id}/attempts/${attemptToken}/result.json`;
   let conversion: RunningConversion | undefined;
 
@@ -135,11 +248,21 @@ export async function handle(
     await Promise.race([
       conversion.completion,
       timeoutSignal(clock, settings.timeoutMs),
+      heartbeat.lost,
     ]);
   } catch (caught) {
     let error = toError(caught);
 
-    if (error instanceof ConversionTimedOutError && conversion) {
+    if (error instanceof LeaseLostError) {
+      if (conversion !== undefined) {
+        // A worker that cannot prove ownership must stop producing immediately.
+        await conversion.kill();
+      }
+      await message.defer(boundedDelay(settings.ownershipLostDeferMs));
+      return;
+    }
+
+    if (error instanceof ConversionTimedOutError && conversion !== undefined) {
       try {
         // Retrying before this resolves could overlap two converters for one job.
         await conversion.kill();
@@ -157,28 +280,32 @@ export async function handle(
       job.id,
       attemptToken,
       transition,
+      settings.now(),
     );
 
     if (!updated) {
-      // Ownership changed while this attempt was running. Never publish or
-      // delete the shared queue message on behalf of the newer owner.
-      await message.retry();
+      // Ownership changed or the lease expired. Never mutate or ack for its owner.
+      await message.defer(boundedDelay(settings.ownershipLostDeferMs));
       return;
     }
 
     if (transition.status === "failed") {
       await message.ack();
     } else {
-      await message.retry();
+      await message.defer(boundedDelay(settings.retryDelayMs(job.attempt)));
     }
     return;
   }
 
-  const published = await store.finishSuccess(job.id, attemptToken, outputKey);
+  const published = await store.finishSuccess(
+    job.id,
+    attemptToken,
+    outputKey,
+    settings.now(),
+  );
   if (!published) {
-    // A recovered/newer attempt owns the job, so this result remains an
-    // unreferenced attempt object and is later removed by an S3 lifecycle rule.
-    await message.retry();
+    // This attempt's object is now an orphan; lifecycle cleanup removes it.
+    await message.defer(boundedDelay(settings.ownershipLostDeferMs));
     return;
   }
 
@@ -193,8 +320,7 @@ async function timeoutSignal(clock: Clock, timeoutMs: number): Promise<never> {
     throw new ConversionTimedOutError(timeoutMs);
   }
 
-  // Clock promises never resolve by contract, but preserve timeout semantics
-  // if an adapter violates that contract.
+  // Preserve timeout semantics even if a Clock adapter violates its contract.
   throw new ConversionTimedOutError(timeoutMs);
 }
 
@@ -229,6 +355,69 @@ function decideFailure(
     timeoutCount,
     resourceExhaustionCount,
   };
+}
+
+/** Default production heartbeat loop; tests can inject a manual scheduler. */
+export function startIntervalLeaseHeartbeat(
+  renew: () => Promise<boolean>,
+  intervalMs: number,
+): RunningLeaseHeartbeat {
+  let stopped = false;
+  let timer: NodeJS.Timeout | undefined;
+  let inFlight = Promise.resolve();
+  let rejectLost!: (reason: unknown) => void;
+  const lost = new Promise<never>((_resolve, reject) => {
+    rejectLost = reject;
+  });
+
+  const schedule = () => {
+    timer = setTimeout(() => {
+      if (stopped) return;
+      inFlight = (async () => {
+        try {
+          if (!(await renew())) {
+            throw new LeaseLostError();
+          }
+          if (!stopped) schedule();
+        } catch (error) {
+          if (!stopped) {
+            rejectLost(
+              error instanceof LeaseLostError
+                ? error
+                : new LeaseLostError(`lease renewal failed: ${toError(error).message}`),
+            );
+          }
+        }
+      })();
+    }, intervalMs);
+    timer.unref?.();
+  };
+
+  schedule();
+  return {
+    lost,
+    stop: async () => {
+      stopped = true;
+      if (timer !== undefined) clearTimeout(timer);
+      await inFlight;
+    },
+  };
+}
+
+function validateLeaseSettings(settings: HandlerOptions): void {
+  if (settings.heartbeatIntervalMs <= 0) {
+    throw new Error("heartbeatIntervalMs must be positive");
+  }
+  if (settings.leaseDurationMs <= settings.heartbeatIntervalMs) {
+    throw new Error("leaseDurationMs must exceed heartbeatIntervalMs");
+  }
+  if (settings.messageVisibilityMs <= settings.heartbeatIntervalMs) {
+    throw new Error("messageVisibilityMs must exceed heartbeatIntervalMs");
+  }
+}
+
+function boundedDelay(delayMs: number): number {
+  return Math.max(1_000, Math.min(Math.ceil(delayMs), MAX_SQS_VISIBILITY_MS));
 }
 
 function toError(value: unknown): Error {

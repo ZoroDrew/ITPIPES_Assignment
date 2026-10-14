@@ -1,11 +1,13 @@
 import type {
+  ClaimRequest,
   ClaimResult,
   FailureTransition,
   Job,
   JobStore,
+  RenewLeaseRequest,
 } from "./worker.js";
 
-/** Reference implementation of the conditional-write semantics used in tests. */
+/** Reference implementation of the DynamoDB conditional-write semantics. */
 export class InMemoryJobStore implements JobStore {
   private readonly jobs = new Map<string, Job>();
 
@@ -20,33 +22,71 @@ export class InMemoryJobStore implements JobStore {
     return job ? clone(job) : undefined;
   }
 
-  async claim(id: string, attemptToken: string): Promise<ClaimResult> {
-    const current = this.jobs.get(id);
+  async claim(request: ClaimRequest): Promise<ClaimResult> {
+    const current = this.jobs.get(request.id);
     if (!current) return { kind: "missing" };
     if (current.status === "succeeded" || current.status === "failed") {
       return { kind: "terminal" };
     }
-    if (current.status === "running") return { kind: "busy" };
+
+    if (
+      current.status === "running" &&
+      (current.leaseExpiresAtMs === undefined ||
+        current.leaseExpiresAtMs > request.nowMs)
+    ) {
+      return {
+        kind: "busy",
+        retryAfterMs:
+          current.leaseExpiresAtMs === undefined
+            ? request.leaseDurationMs
+            : current.leaseExpiresAtMs - request.nowMs,
+      };
+    }
 
     const claimed: Job = {
       ...current,
       status: "running",
       attempt: current.attempt + 1,
-      activeAttemptToken: attemptToken,
+      activeAttemptToken: request.attemptToken,
+      leaseExpiresAtMs: request.nowMs + request.leaseDurationMs,
+      workerVersion: request.workerVersion,
     };
-    this.jobs.set(id, claimed);
+    delete claimed.outputKey;
+    delete claimed.error;
+    this.jobs.set(request.id, claimed);
     return { kind: "claimed", job: clone(claimed) };
+  }
+
+  async renewLease(request: RenewLeaseRequest): Promise<boolean> {
+    const current = this.ownedLiveAttempt(
+      request.id,
+      request.attemptToken,
+      request.nowMs,
+    );
+    if (!current) return false;
+
+    this.jobs.set(request.id, {
+      ...current,
+      leaseExpiresAtMs: request.nowMs + request.leaseDurationMs,
+    });
+    return true;
   }
 
   async finishSuccess(
     id: string,
     attemptToken: string,
     outputKey: string,
+    nowMs: number,
   ): Promise<boolean> {
-    const current = this.ownedAttempt(id, attemptToken);
+    const current = this.ownedLiveAttempt(id, attemptToken, nowMs);
     if (!current) return false;
 
-    const { activeAttemptToken: _discarded, error: _oldError, ...rest } = current;
+    const {
+      activeAttemptToken: _token,
+      leaseExpiresAtMs: _lease,
+      error: _error,
+      ...rest
+    } = current;
     this.jobs.set(id, { ...rest, status: "succeeded", outputKey });
     return true;
   }
@@ -55,12 +95,17 @@ export class InMemoryJobStore implements JobStore {
     id: string,
     attemptToken: string,
     transition: FailureTransition,
+    nowMs: number,
   ): Promise<boolean> {
-    const current = this.ownedAttempt(id, attemptToken);
+    const current = this.ownedLiveAttempt(id, attemptToken, nowMs);
     if (!current) return false;
 
-    const { activeAttemptToken: _discarded, outputKey: _oldOutput, ...rest } =
-      current;
+    const {
+      activeAttemptToken: _token,
+      leaseExpiresAtMs: _lease,
+      outputKey: _output,
+      ...rest
+    } = current;
     this.jobs.set(id, {
       ...rest,
       status: transition.status,
@@ -71,12 +116,18 @@ export class InMemoryJobStore implements JobStore {
     return true;
   }
 
-  private ownedAttempt(id: string, attemptToken: string): Job | undefined {
+  private ownedLiveAttempt(
+    id: string,
+    attemptToken: string,
+    nowMs: number,
+  ): Job | undefined {
     const job = this.jobs.get(id);
     if (
       !job ||
       job.status !== "running" ||
-      job.activeAttemptToken !== attemptToken
+      job.activeAttemptToken !== attemptToken ||
+      job.leaseExpiresAtMs === undefined ||
+      job.leaseExpiresAtMs <= nowMs
     ) {
       return undefined;
     }

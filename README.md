@@ -31,7 +31,10 @@ starter worker's duplicate-conversion and leaked-subprocess bugs.
 - `src/originalWorker.ts` — verbatim starter worker retained for comparison
 - `src/worker.ts` — repaired per-message handler and interfaces
 - `src/inMemoryJobStore.ts` — reference conditional-write implementation
-- `test/worker.test.ts` — focused concurrency, fencing, timeout, and error tests
+- `src/dynamoDbJobStore.ts` — DynamoDB lease/fencing conditional expressions
+- `src/sqsQueueMessage.ts` — SQS delete and visibility-change adapter
+- `test/worker.test.ts` — concurrency, lease, fencing, timeout, and error tests
+- `test/adapters.test.ts` — AWS adapter command/conditional contract tests
 - `test/baseline/originalWorker.test.ts` — intentionally red baseline tests
 - `NOTES.md` — assumptions, remaining risks, stopping point, and AI usage
 
@@ -40,10 +43,12 @@ starter worker's duplicate-conversion and leaked-subprocess bugs.
 The implementation changes `JobStore` from unconditional `get`/`put` methods to
 atomic, intention-revealing operations:
 
-- `claim()` performs `queued -> running`, increments the attempt, and installs
-  an attempt token atomically.
-- `finishSuccess()` and `finishFailure()` succeed only for the token that still
-  owns the running attempt.
+- `claim()` performs `queued/expired-running -> running`, increments the
+  attempt, and installs a token, lease expiry, and worker version atomically.
+- A heartbeat conditionally extends the DynamoDB lease and SQS visibility.
+  Failure to prove ownership kills/reaps the converter before deferring.
+- `finishSuccess()` and `finishFailure()` require a running state, matching
+  attempt token, and unexpired lease.
 - Each attempt writes to its own S3 key. The conditional successful transition
   publishes the winning key.
 - A timed-out converter is killed and reaped before the message is retried.
@@ -51,8 +56,11 @@ atomic, intention-revealing operations:
   error thrown by the clock adapter.
 - Invalid input fails immediately; timeout and exit 137 each retry once; other
   transient failures respect the overall attempt limit.
+- SQS `ack()` maps to `DeleteMessage`; `defer(delayMs)` maps to
+  `ChangeMessageVisibility`, so busy and retry paths cannot hot-loop.
 - SQS receive count is deliberately not used as the conversion attempt count.
 
-The in-memory store documents the conditions a DynamoDB adapter would implement
-with conditional expressions. Production AWS adapters and infrastructure are
-outside this exercise's code scope.
+The AWS adapters are dependency-injected and their contract tests use scripted
+SDK clients, so tests require no AWS credentials. Deployment infrastructure,
+S3 publication, the reconciler/DLQ consumer, and webhook delivery remain outside
+this worker-focused code.

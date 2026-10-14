@@ -6,12 +6,17 @@
   "scripts": {
     "test": "npm run test:fixed",
     "test:original": "tsx --test test/baseline/originalWorker.test.ts",
-    "test:fixed": "tsx --test test/worker.test.ts",
+    "test:fixed": "tsx --test test/worker.test.ts test/adapters.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
     "tsx": "^4.20.0",
     "typescript": "^5.9.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1151.0",
+    "@aws-sdk/client-sqs": "^3.1151.0",
+    "@aws-sdk/lib-dynamodb": "^3.1151.0"
   }
 }
